@@ -1168,6 +1168,11 @@ enum OnboardingUseCase: String, Codable, CaseIterable {
         self == .dictation
     }
 
+    /// Meetings-only installs can later opt into dictation without dropping meetings.
+    var enablingPushToTalk: OnboardingUseCase {
+        self == .meetings ? .dictationAndMeetings : self
+    }
+
     static func resolved(_ rawValue: String?) -> OnboardingUseCase {
         guard let rawValue, let useCase = OnboardingUseCase(rawValue: rawValue) else {
             return .dictation

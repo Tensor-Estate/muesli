@@ -38,9 +38,23 @@ struct ShortcutsView: View {
             .padding(.bottom, MuesliTheme.spacing32)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .onAppear {
+            controller.completePendingPushToTalkEnableIfReady()
+        }
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+            guard !isPushToTalkEnabled else { return }
+            controller.completePendingPushToTalkEnableIfReady()
+            if isPushToTalkEnabled {
+                dictationShortcutMessage = nil
+            }
+        }
         .onDisappear {
             stopRecording()
         }
+    }
+
+    private var isPushToTalkEnabled: Bool {
+        appState.config.resolvedOnboardingUseCase.includesPushToTalk
     }
 
     private enum ShortcutTarget {
@@ -72,6 +86,10 @@ struct ShortcutsView: View {
                 threshold: appState.config.hotkeyTriggerThresholdMS
             ) { value in
                 controller.updateConfig { $0.hotkeyTriggerThresholdMS = value }
+            }
+
+            if !isPushToTalkEnabled {
+                pushToTalkDisabledNotice
             }
 
             if let dictationShortcutMessage {
@@ -274,6 +292,36 @@ struct ShortcutsView: View {
         .help("Hold threshold: \(HotkeyTriggerTiming.minThresholdMilliseconds)-\(HotkeyTriggerTiming.maxThresholdMilliseconds) ms")
     }
 
+    private var pushToTalkDisabledNotice: some View {
+        VStack(alignment: .leading, spacing: MuesliTheme.spacing8) {
+            Text("Push to Talk is off because setup chose meetings only. Enable dictation to start the hotkey monitor.")
+                .font(MuesliTheme.caption())
+                .foregroundStyle(MuesliTheme.textSecondary)
+            Button {
+                let result = controller.enablePushToTalkIfNeeded(requestPermissions: true)
+                switch result {
+                case .alreadyEnabled, .enabled:
+                    dictationShortcutMessage = nil
+                case .needsPermissions:
+                    dictationShortcutMessage = "Grant Microphone, Accessibility, and Input Monitoring, then Push to Talk will turn on."
+                }
+            } label: {
+                Text("Enable Dictation")
+                    .font(MuesliTheme.body())
+                    .foregroundStyle(MuesliTheme.textPrimary)
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, MuesliTheme.spacing12)
+            .padding(.vertical, MuesliTheme.spacing8)
+            .background(MuesliTheme.surfacePrimary)
+            .clipShape(RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall))
+            .overlay(
+                RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall)
+                    .strokeBorder(MuesliTheme.surfaceBorder, lineWidth: 1)
+            )
+        }
+    }
+
     private func shortcutMessage(_ message: String) -> some View {
         Text(message)
             .font(MuesliTheme.caption())
@@ -420,6 +468,11 @@ struct ShortcutsView: View {
         switch target {
         case .dictation:
             result = controller.updateDictationHotkey(config)
+            if result.didUpdate && !isPushToTalkEnabled {
+                dictationShortcutMessage = "Grant Microphone, Accessibility, and Input Monitoring, then Push to Talk will turn on."
+                stopRecording()
+                return
+            }
         case .computerUse:
             result = controller.updateComputerUseHotkey(config)
         case .meetingRecording:
