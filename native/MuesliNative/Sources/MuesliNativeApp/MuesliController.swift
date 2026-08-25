@@ -541,6 +541,9 @@ public final class MuesliController: NSObject {
     private var iCloudSubscriptionGeneration = MuesliICloudOperationGeneration()
     private var hasEnsuredICloudSubscription = false
     private var bridgeActivationPending = false
+    private var bridgeInitialSyncRetryAvailable = false
+    private var bridgeDeferredInitialSyncFailureMessage: String?
+    private var bridgeDeferredInitialSyncFailureReason: String?
     private var bridgeDiscoveryPending = false
     private var bridgeDiscoveryFollowUpPending = false
     private var bridgeCompanionDiscoveryTask: Task<Void, Never>?
@@ -1857,9 +1860,7 @@ public final class MuesliController: NSObject {
 
             guard !Task.isCancelled, let self,
                   self.appState.iCloudBridgeCompanionDeviceName == nil else { return }
-            self.bridgeCompanionDiscoveryTask = nil
-            self.endIPhoneBridgeDeviceDiscoveryActivity()
-            self.appState.iCloudBridgeCompanionDiscoveryState = .timedOut
+            self.finishIPhoneBridgeDeviceDiscovery(foundCompanion: false)
             TelemetryDeck.signal("bridge_device_discovery_timed_out", parameters: ["platform": "macos"])
         }
     }
@@ -1870,6 +1871,7 @@ public final class MuesliController: NSObject {
         bridgeCompanionDiscoveryTask = nil
         endIPhoneBridgeDeviceDiscoveryActivity()
         appState.iCloudBridgeCompanionDiscoveryState = .idle
+        finishDeferredInitialBridgeSyncFailureIfNeeded()
         TelemetryDeck.signal("bridge_device_discovery_cancelled", parameters: ["platform": "macos"])
     }
 
@@ -1893,6 +1895,9 @@ public final class MuesliController: NSObject {
         }
 
         bridgeActivationPending = true
+        bridgeInitialSyncRetryAvailable = true
+        bridgeDeferredInitialSyncFailureMessage = nil
+        bridgeDeferredInitialSyncFailureReason = nil
         appState.isICloudBridgeActivationPending = true
         appState.iCloudSyncStatus = "Checking iCloud..."
         appState.iCloudBridgeState = .checkingICloud
@@ -1928,6 +1933,7 @@ public final class MuesliController: NSObject {
                           self.iCloudSubscriptionGeneration.isCurrent(subscriptionGeneration) else { return }
                     self.iCloudSubscriptionTask = nil
                     self.bridgeActivationPending = false
+                    self.clearInitialBridgeSyncRetryState()
                     self.appState.isICloudBridgeActivationPending = false
                     self.refreshICloudBridgeStateForConfig()
                     self.resumePendingICloudWorkAfterSubscription()
@@ -1939,6 +1945,7 @@ public final class MuesliController: NSObject {
                           self.iCloudSubscriptionGeneration.isCurrent(subscriptionGeneration) else { return }
                     self.iCloudSubscriptionTask = nil
                     self.bridgeActivationPending = false
+                    self.clearInitialBridgeSyncRetryState()
                     self.appState.isICloudBridgeActivationPending = false
                     self.presentICloudSyncFailure(error, statusPrefix: "Sync needs attention")
                     TelemetryDeck.signal(
@@ -1974,6 +1981,7 @@ public final class MuesliController: NSObject {
         }
 
         pendingICloudRecoveryRequest = nil
+        clearInitialBridgeSyncRetryState()
         bridgeActivationPending = true
         appState.isICloudBridgeActivationPending = true
         appState.iCloudSyncStatus = "Reconnecting this Mac to iCloud..."
@@ -2345,6 +2353,7 @@ public final class MuesliController: NSObject {
                     self.appState.iCloudBridgeMessage = nil
                     self.appState.iCloudLastSyncSummary = summary
                     self.appState.iCloudLastSyncedAt = result.syncedAt
+                    self.clearInitialBridgeSyncRetryState()
                     if result.downloaded.total > 0 {
                         TelemetryDeck.signal(
                             "bridge_remote_records_seen",
@@ -2353,6 +2362,7 @@ public final class MuesliController: NSObject {
                     }
                     if self.bridgeActivationPending {
                         self.bridgeActivationPending = false
+                        self.clearInitialBridgeSyncRetryState()
                         self.appState.isICloudBridgeActivationPending = false
                         TelemetryDeck.signal("bridge_enable_completed", parameters: ["platform": "macos"])
                     }
@@ -2392,6 +2402,7 @@ public final class MuesliController: NSObject {
                     self.bridgeDiscoveryFollowUpPending = false
                     if self.bridgeActivationPending {
                         self.bridgeActivationPending = false
+                        self.clearInitialBridgeSyncRetryState()
                         self.appState.isICloudBridgeActivationPending = false
                     }
                     if self.startPendingICloudRecoveryIfNeeded() {
@@ -2414,9 +2425,13 @@ public final class MuesliController: NSObject {
                     self.appState.isICloudSyncInProgress = false
                     let shouldRunBridgeDiscoveryFollowUp = self.bridgeDiscoveryFollowUpPending
                     self.bridgeDiscoveryFollowUpPending = false
+                    if self.handleInitialBridgeSyncFailure(error) {
+                        return
+                    }
                     self.presentICloudSyncFailure(error, statusPrefix: "Sync failed")
                     if self.bridgeActivationPending {
                         self.bridgeActivationPending = false
+                        self.clearInitialBridgeSyncRetryState()
                         self.appState.isICloudBridgeActivationPending = false
                         TelemetryDeck.signal(
                             "bridge_enable_failed",
@@ -2497,6 +2512,70 @@ public final class MuesliController: NSObject {
             appState.iCloudBridgeState = .error
         }
         appState.iCloudBridgeMessage = message
+    }
+
+    @discardableResult
+    private func handleInitialBridgeSyncFailure(_ error: Error) -> Bool {
+        let isRecoverableFailure = !(error is MuesliCKSyncError)
+            && !MuesliICloudSyncEngine.isICloudAccountAvailabilityError(error)
+        let action = ICloudBridgeInitialSyncFailurePolicy.action(
+            isActivationPending: bridgeActivationPending,
+            isRetryAvailable: bridgeInitialSyncRetryAvailable,
+            isRecoverableFailure: isRecoverableFailure,
+            hasCompanionDevice: appState.iCloudBridgeCompanionDeviceName != nil,
+            companionDiscoveryState: appState.iCloudBridgeCompanionDiscoveryState
+        )
+
+        switch action {
+        case .waitForCompanion:
+            bridgeDeferredInitialSyncFailureMessage = error.localizedDescription
+            bridgeDeferredInitialSyncFailureReason = iCloudSyncFailureReason(error)
+            appState.iCloudSyncStatus = "Waiting for your iPhone or iPad to finish setup..."
+            appState.iCloudBridgeState = .syncing
+            appState.iCloudBridgeMessage = nil
+            TelemetryDeck.signal("bridge_initial_sync_retry_deferred", parameters: ["platform": "macos"])
+            return true
+        case .retryNow:
+            retryInitialBridgeSync()
+            return true
+        case .fail:
+            return false
+        }
+    }
+
+    private func retryInitialBridgeSync() {
+        guard bridgeActivationPending, bridgeInitialSyncRetryAvailable else { return }
+        bridgeInitialSyncRetryAvailable = false
+        bridgeDeferredInitialSyncFailureMessage = nil
+        bridgeDeferredInitialSyncFailureReason = nil
+        appState.iCloudSyncStatus = appState.iCloudBridgeCompanionDeviceName == nil
+            ? "Finishing sync setup..."
+            : "Device linked. Finishing sync..."
+        appState.iCloudBridgeState = .syncing
+        appState.iCloudBridgeMessage = nil
+        TelemetryDeck.signal("bridge_initial_sync_retry_started", parameters: ["platform": "macos"])
+        scheduleICloudSync(intent: .manual, delay: 0.2, userInitiated: true)
+    }
+
+    private func finishDeferredInitialBridgeSyncFailureIfNeeded() {
+        guard let message = bridgeDeferredInitialSyncFailureMessage else { return }
+        let reason = bridgeDeferredInitialSyncFailureReason ?? "unknown"
+        clearInitialBridgeSyncRetryState()
+        bridgeActivationPending = false
+        appState.isICloudBridgeActivationPending = false
+        appState.iCloudSyncStatus = "Sync failed: \(message)"
+        appState.iCloudBridgeState = .error
+        appState.iCloudBridgeMessage = message
+        TelemetryDeck.signal(
+            "bridge_enable_failed",
+            parameters: ["platform": "macos", "reason": reason]
+        )
+    }
+
+    private func clearInitialBridgeSyncRetryState() {
+        bridgeInitialSyncRetryAvailable = false
+        bridgeDeferredInitialSyncFailureMessage = nil
+        bridgeDeferredInitialSyncFailureReason = nil
     }
 
     private func iCloudSyncFailureReason(_ error: Error) -> String {
@@ -2615,6 +2694,7 @@ public final class MuesliController: NSObject {
 
     private func resetBridgeDiscoveryRuntimeState() {
         bridgeActivationPending = false
+        clearInitialBridgeSyncRetryState()
         bridgeDiscoveryPending = false
         bridgeDiscoveryFollowUpPending = false
         bridgeCompanionDiscoveryTask?.cancel()
@@ -2632,6 +2712,11 @@ public final class MuesliController: NSObject {
         appState.iCloudBridgeCompanionDiscoveryState = foundCompanion ? .idle : .timedOut
         if foundCompanion, previousState != .idle {
             TelemetryDeck.signal("bridge_device_discovery_completed", parameters: ["platform": "macos"])
+        }
+        if foundCompanion, bridgeDeferredInitialSyncFailureMessage != nil {
+            retryInitialBridgeSync()
+        } else if !foundCompanion {
+            finishDeferredInitialBridgeSyncFailureIfNeeded()
         }
     }
 
