@@ -825,12 +825,7 @@ struct SettingsView: View {
     }
 
     private var displayedICloudBridgeState: ICloudBridgeState {
-        ICloudSyncDisplayStatePolicy.state(
-            rawState: appState.iCloudBridgeState,
-            isEnabled: appState.config.iCloudSyncEnabled,
-            isActivationPending: appState.isICloudBridgeActivationPending,
-            isSyncInProgress: appState.isICloudSyncInProgress
-        )
+        appState.iCloudBridgeState
     }
 
     private var syncStatusText: String {
